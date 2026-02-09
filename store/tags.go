@@ -55,6 +55,46 @@ func GetAllTaggedPaths(db *sql.DB) ([]string, error) {
 	return paths, nil
 }
 
+// GetTagsForPath returns all tag names for a given path.
+func GetTagsForPath(db *sql.DB, path string) ([]string, error) {
+	query := `SELECT name FROM tags WHERE path = ? ORDER BY name`
+	rows, err := db.Query(query, path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get tags for path: %w", err)
+	}
+	defer rows.Close()
+
+	var tags []string
+	for rows.Next() {
+		var tag string
+		if err := rows.Scan(&tag); err != nil {
+			return nil, err
+		}
+		tags = append(tags, tag)
+	}
+	return tags, nil
+}
+
+// GetAllTags returns all unique tag names.
+func GetAllTags(db *sql.DB) ([]string, error) {
+	query := `SELECT DISTINCT name FROM tags ORDER BY name`
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get all tags: %w", err)
+	}
+	defer rows.Close()
+
+	var tags []string
+	for rows.Next() {
+		var tag string
+		if err := rows.Scan(&tag); err != nil {
+			return nil, err
+		}
+		tags = append(tags, tag)
+	}
+	return tags, nil
+}
+
 // RemovePathFromTag removes a path from a specific tag.
 func RemovePathFromTag(db *sql.DB, tagName, path string) error {
 	query := `DELETE FROM tags WHERE name = ? AND path = ?`

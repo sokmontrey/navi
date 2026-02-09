@@ -37,7 +37,7 @@ func Walk(root string) ([]string, error) {
 
 		// Default ignores
 		if d.IsDir() {
-			if strings.HasPrefix(d.Name(), ".") && d.Name() != "." {
+		if strings.HasPrefix(d.Name(), ".") && d.Name() != "." {
 				return filepath.SkipDir // Skip hidden directories
 			}
 			if d.Name() == "node_modules" || d.Name() == "vendor" {

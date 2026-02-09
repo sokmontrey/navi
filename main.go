@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -34,10 +35,35 @@ type model struct {
 	err          error
 	isInitialLoad bool // Track if this is the initial load
 	currentDirLoaded bool // Track if current directory files have been loaded
+	mode         viewMode
+	config       appConfig
+	configField  int
+	configEditing bool
+	configInput  textinput.Model
+	tagPath      string
+	tagList      []string
+	tagSelected  int
+	tagEditing   bool
+	tagInput     textinput.Model
 }
 
 type filesLoadedMsg []string
 type searchDoneMsg []search.Result
+
+type viewMode int
+
+const (
+	modeBrowse viewMode = iota
+	modeConfig
+	modeTags
+)
+
+type appConfig struct {
+	DefaultAction string
+	TerminalCmd   string
+	ExplorerCmd   string
+	EditorCmd     string
+}
 
 // loadInitialFiles loads recent history + tagged paths for initial app load
 func loadInitialFiles(db *sql.DB) tea.Cmd {
@@ -224,7 +250,158 @@ func performSearch(files []string, query string) tea.Cmd {
 	}
 }
 
-func initialModel(db *sql.DB) model {
+func buildSearchList(db *sql.DB, root string) []string {
+	// Build history + tags list
+	recentHistory, _ := store.GetRecentHistory(db, 100)
+	tagged, _ := store.GetAllTaggedPaths(db)
+	pathSet := make(map[string]bool)
+	var historyFiles []string
+	for _, h := range recentHistory {
+		if !pathSet[h.Path] {
+			pathSet[h.Path] = true
+			historyFiles = append(historyFiles, h.Path)
+		}
+	}
+	for _, p := range tagged {
+		if !pathSet[p] {
+			pathSet[p] = true
+			historyFiles = append(historyFiles, p)
+		}
+	}
+
+	currentFiles, _ := search.Walk(root)
+	return combineFiles(historyFiles, currentFiles)
+}
+
+func defaultConfig() appConfig {
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		editor = "nvim"
+	}
+	terminal := os.Getenv("TERMINAL")
+	if terminal == "" {
+		terminal = "xterm"
+	}
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		shell = "/bin/bash"
+	}
+
+	return appConfig{
+		DefaultAction: "explorer",
+		TerminalCmd:   fmt.Sprintf(`%s -e bash -lc 'cd "%s"; exec %s'`, terminal, "{path}", shell),
+		ExplorerCmd:   `xdg-open "{path}"`,
+		EditorCmd:     fmt.Sprintf(`%s "{path}"`, editor),
+	}
+}
+
+func loadConfig(db *sql.DB) appConfig {
+	cfg := defaultConfig()
+	if v, _ := store.GetSetting(db, "default_action"); v != "" {
+		cfg.DefaultAction = v
+	}
+	if v, _ := store.GetSetting(db, "terminal_cmd"); v != "" {
+		cfg.TerminalCmd = v
+	}
+	if v, _ := store.GetSetting(db, "explorer_cmd"); v != "" {
+		cfg.ExplorerCmd = v
+	}
+	if v, _ := store.GetSetting(db, "editor_cmd"); v != "" {
+		cfg.EditorCmd = v
+	}
+	return cfg
+}
+
+func saveConfig(db *sql.DB, cfg appConfig) {
+	_ = store.SetSetting(db, "default_action", cfg.DefaultAction)
+	_ = store.SetSetting(db, "terminal_cmd", cfg.TerminalCmd)
+	_ = store.SetSetting(db, "explorer_cmd", cfg.ExplorerCmd)
+	_ = store.SetSetting(db, "editor_cmd", cfg.EditorCmd)
+}
+
+func runCommandTemplate(cmdTemplate, path string) error {
+	cmdStr := strings.ReplaceAll(cmdTemplate, "{path}", path)
+	cmd := exec.Command("bash", "-lc", cmdStr)
+	return cmd.Start()
+}
+
+func copyToClipboard(path string) error {
+	if _, err := exec.LookPath("wl-copy"); err == nil {
+		cmd := exec.Command("wl-copy")
+		cmd.Stdin = strings.NewReader(path)
+		return cmd.Run()
+	}
+	if _, err := exec.LookPath("xclip"); err == nil {
+		cmd := exec.Command("xclip", "-selection", "clipboard")
+		cmd.Stdin = strings.NewReader(path)
+		return cmd.Run()
+	}
+	return fmt.Errorf("clipboard tool not found (need wl-copy or xclip)")
+}
+
+func pasteToFocusedInput(text string) {
+	if _, err := exec.LookPath("wtype"); err == nil {
+		cmd := exec.Command("wtype", "-d", "60", "--", text)
+		_ = cmd.Start()
+		return
+	}
+	if _, err := exec.LookPath("xdotool"); err == nil {
+		cmd := exec.Command("xdotool", "type", "--delay", "1", "--clearmodifiers", text)
+		_ = cmd.Start()
+		return
+	}
+}
+
+func performAction(cfg appConfig, selectedPath string) {
+	absPath, err := filepath.Abs(selectedPath)
+	if err != nil {
+		absPath = selectedPath
+	}
+	path := absPath
+	info, err := os.Stat(selectedPath)
+	if err == nil && !info.IsDir() {
+		path = filepath.Dir(absPath)
+	}
+
+	switch cfg.DefaultAction {
+	case "terminal":
+		_ = runCommandTemplate(cfg.TerminalCmd, path)
+	case "explorer":
+		_ = runCommandTemplate(cfg.ExplorerCmd, path)
+	case "editor":
+		_ = runCommandTemplate(cfg.EditorCmd, absPath)
+	case "copy":
+		if err := copyToClipboard(absPath); err == nil {
+			pasteToFocusedInput(absPath)
+		}
+	default:
+		_ = runCommandTemplate(cfg.TerminalCmd, path)
+	}
+}
+
+func resolveSelectedPath(selectedPath, baseDir string) string {
+	if selectedPath == "" {
+		return ""
+	}
+	if filepath.IsAbs(selectedPath) {
+		return selectedPath
+	}
+	cleaned := filepath.Clean(selectedPath)
+	baseClean := filepath.Clean(baseDir)
+	if baseClean != "" {
+		// If cleaned already looks like an absolute path without leading slash, fix it.
+		baseNoSlash := strings.TrimPrefix(baseClean, string(filepath.Separator))
+		if strings.HasPrefix(cleaned, baseNoSlash) {
+			return string(filepath.Separator) + cleaned
+		}
+	}
+	if baseClean == "" {
+		return cleaned
+	}
+	return filepath.Join(baseClean, cleaned)
+}
+
+func initialModel(db *sql.DB, cfg appConfig) model {
 	ti := textinput.New()
 	ti.Placeholder = "Search... (use @tag for scopes)"
 	ti.Focus()
@@ -237,6 +414,16 @@ func initialModel(db *sql.DB) model {
 
 	// Init empty tree
 	tm := ui.NewTreeModel([]string{}, 80, 20, make(map[string]bool))
+	configInput := textinput.New()
+	configInput.Placeholder = "Value"
+	configInput.CharLimit = 256
+	configInput.Width = 40
+
+	tagInput := textinput.New()
+	tagInput.Placeholder = "Tag"
+	tagInput.CharLimit = 64
+	tagInput.Width = 30
+	tagInput.Blur()
 
 	return model{
 		db:           db,
@@ -246,6 +433,13 @@ func initialModel(db *sql.DB) model {
 		historyPaths: make(map[string]bool),
 		isInitialLoad: true,
 		currentDirLoaded: false,
+		mode:         modeBrowse,
+		config:       cfg,
+		configField:  0,
+		configEditing: false,
+		configInput:  configInput,
+		tagEditing:   false,
+		tagInput:     tagInput,
 	}
 }
 
@@ -335,9 +529,176 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.tree = ui.NewTreeModel(paths, treeWidth, treeHeight, m.historyPaths)
 
 	case tea.KeyMsg:
+		if m.mode == modeConfig {
+			if m.configEditing {
+				switch msg.String() {
+				case "esc":
+					m.configEditing = false
+					m.configInput.SetValue("")
+				case "enter":
+					m.configEditing = false
+					val := m.configInput.Value()
+					switch m.configField {
+					case 1:
+						m.config.TerminalCmd = val
+					case 2:
+						m.config.ExplorerCmd = val
+					case 3:
+						m.config.EditorCmd = val
+					}
+					saveConfig(m.db, m.config)
+				default:
+					m.configInput, cmd = m.configInput.Update(msg)
+					cmds = append(cmds, cmd)
+				}
+				return m, tea.Batch(cmds...)
+			}
+
+			switch msg.String() {
+			case "esc":
+				m.mode = modeBrowse
+				m.configEditing = false
+				m.configInput.SetValue("")
+				return m, nil
+			case "up":
+				if m.configField > 0 {
+					m.configField--
+				}
+			case "down":
+				if m.configField < 3 {
+					m.configField++
+				}
+			case "left", "right", " ":
+				if m.configField == 0 {
+					actions := []string{"terminal", "explorer", "editor", "copy"}
+					idx := 0
+					for i, a := range actions {
+						if a == m.config.DefaultAction {
+							idx = i
+							break
+						}
+					}
+					if msg.String() == "left" {
+						idx = (idx + len(actions) - 1) % len(actions)
+					} else {
+						idx = (idx + 1) % len(actions)
+					}
+					m.config.DefaultAction = actions[idx]
+					saveConfig(m.db, m.config)
+				}
+			case "enter":
+				if m.configField == 0 {
+					return m, nil
+				}
+				m.configEditing = true
+				switch m.configField {
+				case 1:
+					m.configInput.SetValue(m.config.TerminalCmd)
+				case 2:
+					m.configInput.SetValue(m.config.ExplorerCmd)
+				case 3:
+					m.configInput.SetValue(m.config.EditorCmd)
+				}
+				m.configInput.CursorEnd()
+			}
+			return m, tea.Batch(cmds...)
+		}
+
+		if m.mode == modeTags {
+			if m.tagEditing {
+				switch msg.String() {
+				case "esc":
+					m.tagEditing = false
+					m.tagInput.Blur()
+					m.tagInput.SetValue("")
+				case "enter":
+					tag := strings.TrimSpace(m.tagInput.Value())
+					if tag != "" {
+						_ = store.AddPathToTag(m.db, tag, m.tagPath)
+						m.tagList, _ = store.GetTagsForPath(m.db, m.tagPath)
+					}
+					m.tagEditing = false
+					m.tagInput.Blur()
+					m.tagInput.SetValue("")
+				default:
+					m.tagInput, cmd = m.tagInput.Update(msg)
+					cmds = append(cmds, cmd)
+				}
+				return m, tea.Batch(cmds...)
+			}
+
+			switch msg.String() {
+			case "esc":
+				m.mode = modeBrowse
+				m.tagEditing = false
+				m.tagInput.SetValue("")
+				return m, nil
+			case "up":
+				if m.tagSelected > 0 {
+					m.tagSelected--
+				}
+			case "down":
+				if m.tagSelected < len(m.tagList)-1 {
+					m.tagSelected++
+				}
+			case "a":
+				m.tagEditing = true
+				m.tagInput.SetValue("")
+				m.tagInput.Focus()
+				m.tagInput.CursorEnd()
+			case "d":
+				if len(m.tagList) > 0 && m.tagSelected >= 0 && m.tagSelected < len(m.tagList) {
+					_ = store.RemovePathFromTag(m.db, m.tagList[m.tagSelected], m.tagPath)
+					m.tagList, _ = store.GetTagsForPath(m.db, m.tagPath)
+					if m.tagSelected >= len(m.tagList) {
+						m.tagSelected = len(m.tagList) - 1
+					}
+				}
+			}
+			return m, tea.Batch(cmds...)
+		}
+
 		switch msg.String() {
 		case "ctrl+c":
 			return m, tea.Quit
+		case "ctrl+o":
+			m.mode = modeConfig
+			return m, nil
+		case "ctrl+t":
+			selectedPath := m.tree.SelectedPath()
+			if selectedPath == "" {
+				selectedPath = m.currentDir
+			}
+			if info, err := os.Stat(selectedPath); err == nil && !info.IsDir() {
+				selectedPath = filepath.Dir(selectedPath)
+			}
+			selectedPath = resolveSelectedPath(selectedPath, m.currentDir)
+			if absPath, err := filepath.Abs(selectedPath); err == nil {
+				selectedPath = absPath
+			}
+			m.tagPath = selectedPath
+			m.tagList, _ = store.GetTagsForPath(m.db, m.tagPath)
+			m.tagSelected = 0
+			m.tagEditing = false
+			m.tagInput.SetValue("")
+			m.mode = modeTags
+			return m, nil
+		case "ctrl+d":
+			// Drill down into directory without triggering action
+			selectedPath := m.tree.SelectedPath()
+			if selectedPath == "" {
+				return m, nil
+			}
+			if info, err := os.Stat(resolveSelectedPath(selectedPath, m.currentDir)); err == nil && info.IsDir() {
+				_ = store.UpdateFrecency(m.db, resolveSelectedPath(selectedPath, m.currentDir))
+				m.historyPaths[selectedPath] = true
+				m.currentDir = resolveSelectedPath(selectedPath, m.currentDir)
+				m.input.SetValue("")
+				m.activeTag = ""
+				m.currentDirLoaded = false
+				cmds = append(cmds, loadFiles(m.db, m.currentDir))
+			}
+			return m, tea.Batch(cmds...)
 		case "enter":
 			// Handle Selection form Tree
 			selectedPath := m.tree.SelectedPath()
@@ -345,27 +706,42 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
-			// If Directory (check via os.Stat)
-			info, err := os.Stat(selectedPath)
-			if err == nil && info.IsDir() {
-				// Update History for Dir
-				_ = store.UpdateFrecency(m.db, selectedPath)
-				// Mark as history
-				m.historyPaths[selectedPath] = true
-				// Drill down
-				m.currentDir = selectedPath
-				m.input.SetValue("")
-				m.activeTag = ""
-				m.currentDirLoaded = false // Reset since we're changing directory
-				cmds = append(cmds, loadFiles(m.db, m.currentDir))
-			} else {
-				// File -> Update History, Select and Quit
-				_ = store.UpdateFrecency(m.db, selectedPath)
-				// Mark as history
-				m.historyPaths[selectedPath] = true
-				m.selectedPath = selectedPath
-				return m, tea.Quit
+			resolvedPath := resolveSelectedPath(selectedPath, m.currentDir)
+			if absPath, err := filepath.Abs(resolvedPath); err == nil {
+				resolvedPath = absPath
 			}
+			// Update History
+			_ = store.UpdateFrecency(m.db, resolvedPath)
+			// Mark as history (use tree path for highlighting)
+			m.historyPaths[selectedPath] = true
+			m.selectedPath = resolvedPath
+			performAction(m.config, resolvedPath)
+			return m, tea.Quit
+
+		case "tab":
+			actions := []string{"terminal", "explorer", "editor", "copy"}
+			idx := 0
+			for i, a := range actions {
+				if a == m.config.DefaultAction {
+					idx = i
+					break
+				}
+			}
+			idx = (idx + 1) % len(actions)
+			m.config.DefaultAction = actions[idx]
+			saveConfig(m.db, m.config)
+		case "shift+tab":
+			actions := []string{"terminal", "explorer", "editor", "copy"}
+			idx := 0
+			for i, a := range actions {
+				if a == m.config.DefaultAction {
+					idx = i
+					break
+				}
+			}
+			idx = (idx + len(actions) - 1) % len(actions)
+			m.config.DefaultAction = actions[idx]
+			saveConfig(m.db, m.config)
 
 		case "up", "down", "left", "right":
 			// Pass to tree
@@ -460,6 +836,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) View() string {
+	if m.mode == modeConfig {
+		return m.configView()
+	}
+	if m.mode == modeTags {
+		return m.tagsView()
+	}
+
 	header := m.input.View()
 	if m.activeTag != "" {
 		tagStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true)
@@ -470,12 +853,95 @@ func (m model) View() string {
 		lipgloss.Left,
 		header,
 		m.tree.View(),
+		m.actionTabsView(),
+	)
+}
+
+func (m model) actionTabsView() string {
+	actions := []string{"terminal", "explorer", "editor", "copy"}
+	var tabs []string
+	for _, a := range actions {
+		style := lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+		if a == m.config.DefaultAction {
+			style = lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true)
+		}
+		tabs = append(tabs, style.Render("["+a+"]"))
+	}
+	help := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("Tab: cycle action")
+	return lipgloss.JoinHorizontal(lipgloss.Left, strings.Join(tabs, " "), "  ", help)
+}
+
+func (m model) configView() string {
+	title := lipgloss.NewStyle().Bold(true).Render("Config")
+	help := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("Esc: back • Enter: edit/save • Left/Right: cycle default")
+
+	fields := []string{
+		fmt.Sprintf("Default action: %s", m.config.DefaultAction),
+		fmt.Sprintf("Terminal cmd: %s", m.config.TerminalCmd),
+		fmt.Sprintf("Explorer cmd: %s", m.config.ExplorerCmd),
+		fmt.Sprintf("Editor cmd: %s", m.config.EditorCmd),
+	}
+
+	var lines []string
+	for i, f := range fields {
+		prefix := "  "
+		if i == m.configField {
+			prefix = "> "
+		}
+		lines = append(lines, prefix+f)
+	}
+
+	editLine := ""
+	if m.configEditing {
+		editLine = lipgloss.NewStyle().Foreground(lipgloss.Color("62")).Render("Edit: ") + m.configInput.View()
+	}
+
+	return lipgloss.JoinVertical(
+		lipgloss.Left,
+		title,
+		help,
+		strings.Join(lines, "\n"),
+		editLine,
+	)
+}
+
+func (m model) tagsView() string {
+	title := lipgloss.NewStyle().Bold(true).Render("Tags")
+	pathLine := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render(m.tagPath)
+	help := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("A: add • D: delete • Esc: back • Enter: save tag")
+
+	var lines []string
+	if len(m.tagList) == 0 {
+		lines = append(lines, "(no tags)")
+	} else {
+		for i, t := range m.tagList {
+			prefix := "  "
+			if i == m.tagSelected {
+				prefix = "> "
+			}
+			lines = append(lines, prefix+t)
+		}
+	}
+
+	editLine := ""
+	if m.tagEditing {
+		editLine = lipgloss.NewStyle().Foreground(lipgloss.Color("62")).Render("Add tag: ") + m.tagInput.View()
+	}
+
+	return lipgloss.JoinVertical(
+		lipgloss.Left,
+		title,
+		pathLine,
+		help,
+		strings.Join(lines, "\n"),
+		editLine,
 	)
 }
 
 func main() {
 	// CLI Flags
 	addTag := flag.String("add", "", "Add current directory to a tag")
+	startAction := flag.String("action", "", "Start with action: terminal|explorer|editor|copy")
 	flag.Parse()
 
 	// Init DB
@@ -500,7 +966,35 @@ func main() {
 		return
 	}
 
-	p := tea.NewProgram(initialModel(db), tea.WithAltScreen())
+	// Non-interactive: if args provided, return best match and exit
+	if args := flag.Args(); len(args) > 0 {
+		query := strings.Join(args, " ")
+		cwd, _ := os.Getwd()
+		files := buildSearchList(db, cwd)
+		results := search.FuzzyHierarchical(files, query)
+		if len(results) == 0 {
+			os.Exit(1)
+		}
+		best := resolveSelectedPath(results[0].Path, cwd)
+		if absPath, err := filepath.Abs(best); err == nil {
+			best = absPath
+		}
+		fmt.Println(best)
+		return
+	}
+
+	cfg := loadConfig(db)
+	if *startAction != "" {
+		switch *startAction {
+		case "terminal", "explorer", "editor", "copy":
+			cfg.DefaultAction = *startAction
+		default:
+			fmt.Fprintf(os.Stderr, "invalid action: %s\n", *startAction)
+			os.Exit(1)
+		}
+	}
+
+	p := tea.NewProgram(initialModel(db, cfg), tea.WithAltScreen())
 	finalModel, err := p.Run()
 	if err != nil {
 		fmt.Printf("Alas, there's been an error: %v", err)
