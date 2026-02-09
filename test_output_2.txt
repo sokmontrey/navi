@@ -1,0 +1,14 @@
+=== RUN   TestGapSearch
+=== RUN   TestGapSearch/Single_term_match
+=== RUN   TestGapSearch/Gap_match_(foo_..._bar)
+=== RUN   TestGapSearch/Gap_match_(baz_..._bar)
+=== RUN   TestGapSearch/Reverse_order_(bar_..._foo)_-_Should_NOT_match
+=== RUN   TestGapSearch/Partial_characters_(s/f/b)
+--- PASS: TestGapSearch (0.00s)
+    --- PASS: TestGapSearch/Single_term_match (0.00s)
+    --- PASS: TestGapSearch/Gap_match_(foo_..._bar) (0.00s)
+    --- PASS: TestGapSearch/Gap_match_(baz_..._bar) (0.00s)
+    --- PASS: TestGapSearch/Reverse_order_(bar_..._foo)_-_Should_NOT_match (0.00s)
+    --- PASS: TestGapSearch/Partial_characters_(s/f/b) (0.00s)
+PASS
+ok  	github.com/montrey/navi/search	0.001s
