@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -40,6 +41,11 @@ type model struct {
 	configField  int
 	configEditing bool
 	configInput  textinput.Model
+	customActionIndex int
+	customEditing bool
+	customEditStep int // 0=name, 1=cmd
+	customEditNew  bool
+	customEditName string
 	tagPath      string
 	tagList      []string
 	tagSelected  int
@@ -63,6 +69,7 @@ type appConfig struct {
 	TerminalCmd   string
 	ExplorerCmd   string
 	EditorCmd     string
+	CustomActions string // Format: name=cmd; name2=cmd2
 }
 
 // loadInitialFiles loads recent history + tagged paths for initial app load
@@ -287,11 +294,18 @@ func defaultConfig() appConfig {
 		shell = "/bin/bash"
 	}
 
+	editorCmd := fmt.Sprintf(`%s "{path}"`, editor)
+	// If editor is nvim, run it inside a terminal.
+	if filepath.Base(editor) == "nvim" {
+		editorCmd = fmt.Sprintf(`%s -e nvim "%s"`, terminal, "{path}")
+	}
+
 	return appConfig{
 		DefaultAction: "explorer",
 		TerminalCmd:   fmt.Sprintf(`%s -e bash -lc 'cd "%s"; exec %s'`, terminal, "{path}", shell),
 		ExplorerCmd:   `xdg-open "{path}"`,
-		EditorCmd:     fmt.Sprintf(`%s "{path}"`, editor),
+		EditorCmd:     editorCmd,
+		CustomActions: "",
 	}
 }
 
@@ -309,6 +323,9 @@ func loadConfig(db *sql.DB) appConfig {
 	if v, _ := store.GetSetting(db, "editor_cmd"); v != "" {
 		cfg.EditorCmd = v
 	}
+	if v, _ := store.GetSetting(db, "custom_actions"); v != "" {
+		cfg.CustomActions = v
+	}
 	return cfg
 }
 
@@ -317,11 +334,20 @@ func saveConfig(db *sql.DB, cfg appConfig) {
 	_ = store.SetSetting(db, "terminal_cmd", cfg.TerminalCmd)
 	_ = store.SetSetting(db, "explorer_cmd", cfg.ExplorerCmd)
 	_ = store.SetSetting(db, "editor_cmd", cfg.EditorCmd)
+	_ = store.SetSetting(db, "custom_actions", cfg.CustomActions)
 }
 
 func runCommandTemplate(cmdTemplate, path string) error {
 	cmdStr := strings.ReplaceAll(cmdTemplate, "{path}", path)
 	cmd := exec.Command("bash", "-lc", cmdStr)
+	// Detach from the TUI process so the child keeps running after exit.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0); err == nil {
+		defer devNull.Close()
+		cmd.Stdin = devNull
+		cmd.Stdout = devNull
+		cmd.Stderr = devNull
+	}
 	return cmd.Start()
 }
 
@@ -375,8 +401,71 @@ func performAction(cfg appConfig, selectedPath string) {
 			pasteToFocusedInput(absPath)
 		}
 	default:
-		_ = runCommandTemplate(cfg.TerminalCmd, path)
+		if cmd, ok := customActionCommand(cfg, cfg.DefaultAction); ok {
+			_ = runCommandTemplate(cmd, absPath)
+		} else {
+			_ = runCommandTemplate(cfg.TerminalCmd, path)
+		}
 	}
+}
+
+type customAction struct {
+	Name string
+	Cmd  string
+}
+
+func parseCustomActions(raw string) []customAction {
+	var actions []customAction
+	parts := strings.Split(raw, ";")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		name, cmd, found := strings.Cut(part, "=")
+		name = strings.TrimSpace(name)
+		cmd = strings.TrimSpace(cmd)
+		if !found || name == "" || cmd == "" {
+			continue
+		}
+		actions = append(actions, customAction{Name: name, Cmd: cmd})
+	}
+	return actions
+}
+
+func serializeCustomActions(actions []customAction) string {
+	var parts []string
+	for _, c := range actions {
+		parts = append(parts, c.Name+"="+c.Cmd)
+	}
+	return strings.Join(parts, "; ")
+}
+
+func buildActions(cfg appConfig) []string {
+	actions := []string{"explorer", "terminal", "editor", "copy"}
+	for _, a := range parseCustomActions(cfg.CustomActions) {
+		actions = append(actions, a.Name)
+	}
+	return actions
+}
+
+func ensureDefaultAction(cfg *appConfig) {
+	actions := buildActions(*cfg)
+	for _, a := range actions {
+		if a == cfg.DefaultAction {
+			return
+		}
+	}
+	cfg.DefaultAction = "explorer"
+}
+
+func customActionCommand(cfg appConfig, action string) (string, bool) {
+	for _, a := range parseCustomActions(cfg.CustomActions) {
+		if a.Name == action {
+			return a.Cmd, true
+		}
+	}
+	return "", false
 }
 
 func resolveSelectedPath(selectedPath, baseDir string) string {
@@ -416,7 +505,7 @@ func initialModel(db *sql.DB, cfg appConfig) model {
 	tm := ui.NewTreeModel([]string{}, 80, 20, make(map[string]bool))
 	configInput := textinput.New()
 	configInput.Placeholder = "Value"
-	configInput.CharLimit = 256
+	configInput.CharLimit = 512
 	configInput.Width = 40
 
 	tagInput := textinput.New()
@@ -438,6 +527,11 @@ func initialModel(db *sql.DB, cfg appConfig) model {
 		configField:  0,
 		configEditing: false,
 		configInput:  configInput,
+		customActionIndex: 0,
+		customEditing: false,
+		customEditStep: 0,
+		customEditNew: false,
+		customEditName: "",
 		tagEditing:   false,
 		tagInput:     tagInput,
 	}
@@ -530,23 +624,66 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		if m.mode == modeConfig {
-			if m.configEditing {
+			if m.configEditing || m.customEditing {
 				switch msg.String() {
 				case "esc":
 					m.configEditing = false
 					m.configInput.SetValue("")
+					m.configInput.Blur()
+					m.customEditing = false
+					m.customEditStep = 0
+					m.customEditNew = false
+					m.customEditName = ""
 				case "enter":
-					m.configEditing = false
-					val := m.configInput.Value()
-					switch m.configField {
-					case 1:
-						m.config.TerminalCmd = val
-					case 2:
-						m.config.ExplorerCmd = val
-					case 3:
-						m.config.EditorCmd = val
+					if m.customEditing && m.configField == 4 {
+						val := strings.TrimSpace(m.configInput.Value())
+						customs := parseCustomActions(m.config.CustomActions)
+						if m.customEditStep == 0 {
+							m.customEditName = val
+							m.customEditStep = 1
+							var existingCmd string
+							if !m.customEditNew && m.customActionIndex >= 0 && m.customActionIndex < len(customs) {
+								existingCmd = customs[m.customActionIndex].Cmd
+							}
+							m.configInput.SetValue(existingCmd)
+							m.configInput.CursorEnd()
+						} else {
+							cmd := val
+							if m.customEditName != "" && cmd != "" {
+								if m.customEditNew {
+									customs = append(customs, customAction{Name: m.customEditName, Cmd: cmd})
+									m.customActionIndex = len(customs) - 1
+								} else if m.customActionIndex >= 0 && m.customActionIndex < len(customs) {
+									customs[m.customActionIndex] = customAction{Name: m.customEditName, Cmd: cmd}
+								}
+								m.config.CustomActions = serializeCustomActions(customs)
+								ensureDefaultAction(&m.config)
+								saveConfig(m.db, m.config)
+							}
+							m.customEditing = false
+							m.customEditStep = 0
+							m.customEditNew = false
+							m.customEditName = ""
+							m.configInput.Blur()
+							m.configInput.SetValue("")
+						}
+					} else {
+						m.configEditing = false
+						val := m.configInput.Value()
+						switch m.configField {
+						case 1:
+							m.config.TerminalCmd = val
+						case 2:
+							m.config.ExplorerCmd = val
+						case 3:
+							m.config.EditorCmd = val
+						case 4:
+							m.config.CustomActions = val
+							ensureDefaultAction(&m.config)
+						}
+						saveConfig(m.db, m.config)
+						m.configInput.Blur()
 					}
-					saveConfig(m.db, m.config)
 				default:
 					m.configInput, cmd = m.configInput.Update(msg)
 					cmds = append(cmds, cmd)
@@ -559,18 +696,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.mode = modeBrowse
 				m.configEditing = false
 				m.configInput.SetValue("")
+				m.customEditing = false
+				m.customEditStep = 0
+				m.customEditNew = false
+				m.customEditName = ""
 				return m, nil
 			case "up":
 				if m.configField > 0 {
 					m.configField--
 				}
 			case "down":
-				if m.configField < 3 {
+				if m.configField < 4 {
 					m.configField++
 				}
 			case "left", "right", " ":
 				if m.configField == 0 {
-					actions := []string{"terminal", "explorer", "editor", "copy"}
+					actions := buildActions(m.config)
 					idx := 0
 					for i, a := range actions {
 						if a == m.config.DefaultAction {
@@ -585,21 +726,81 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 					m.config.DefaultAction = actions[idx]
 					saveConfig(m.db, m.config)
+				} else if m.configField == 4 {
+					customs := parseCustomActions(m.config.CustomActions)
+					if len(customs) == 0 {
+						break
+					}
+					if msg.String() == "left" {
+						m.customActionIndex = (m.customActionIndex + len(customs) - 1) % len(customs)
+					} else {
+						m.customActionIndex = (m.customActionIndex + 1) % len(customs)
+					}
+				}
+			case "d":
+				if m.configField == 4 {
+					customs := parseCustomActions(m.config.CustomActions)
+					if len(customs) == 0 {
+						break
+					}
+					if m.customActionIndex < 0 || m.customActionIndex >= len(customs) {
+						m.customActionIndex = 0
+					}
+					customs = append(customs[:m.customActionIndex], customs[m.customActionIndex+1:]...)
+					var parts []string
+					for _, c := range customs {
+						parts = append(parts, c.Name+"="+c.Cmd)
+					}
+					m.config.CustomActions = strings.Join(parts, "; ")
+					if m.customActionIndex >= len(customs) && len(customs) > 0 {
+						m.customActionIndex = len(customs) - 1
+					}
+					ensureDefaultAction(&m.config)
+					saveConfig(m.db, m.config)
+				}
+			case "a":
+				if m.configField == 4 {
+					m.customEditing = true
+					m.customEditNew = true
+					m.customEditStep = 0
+					m.customEditName = ""
+					m.configInput.SetValue("")
+					m.configInput.Focus()
+					m.configInput.CursorEnd()
+					return m, tea.Batch(cmds...)
 				}
 			case "enter":
 				if m.configField == 0 {
 					return m, nil
 				}
-				m.configEditing = true
-				switch m.configField {
-				case 1:
-					m.configInput.SetValue(m.config.TerminalCmd)
-				case 2:
-					m.configInput.SetValue(m.config.ExplorerCmd)
-				case 3:
-					m.configInput.SetValue(m.config.EditorCmd)
+				if m.configField == 4 {
+					customs := parseCustomActions(m.config.CustomActions)
+					if len(customs) == 0 {
+						return m, nil
+					}
+					if m.customActionIndex < 0 || m.customActionIndex >= len(customs) {
+						m.customActionIndex = 0
+					}
+					m.customEditing = true
+					m.customEditNew = false
+					m.customEditStep = 0
+					m.customEditName = ""
+					m.configInput.SetValue(customs[m.customActionIndex].Name)
+					m.configInput.Focus()
+					m.configInput.CursorEnd()
+				} else {
+					m.configEditing = true
+					switch m.configField {
+					case 1:
+						m.configInput.SetValue(m.config.TerminalCmd)
+					case 2:
+						m.configInput.SetValue(m.config.ExplorerCmd)
+					case 3:
+						m.configInput.SetValue(m.config.EditorCmd)
+					}
+					m.configInput.Focus()
+					m.configInput.CursorEnd()
 				}
-				m.configInput.CursorEnd()
 			}
 			return m, tea.Batch(cmds...)
 		}
@@ -719,7 +920,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 
 		case "tab":
-			actions := []string{"terminal", "explorer", "editor", "copy"}
+			actions := buildActions(m.config)
 			idx := 0
 			for i, a := range actions {
 				if a == m.config.DefaultAction {
@@ -729,9 +930,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			idx = (idx + 1) % len(actions)
 			m.config.DefaultAction = actions[idx]
-			saveConfig(m.db, m.config)
 		case "shift+tab":
-			actions := []string{"terminal", "explorer", "editor", "copy"}
+			actions := buildActions(m.config)
 			idx := 0
 			for i, a := range actions {
 				if a == m.config.DefaultAction {
@@ -741,7 +941,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			idx = (idx + len(actions) - 1) % len(actions)
 			m.config.DefaultAction = actions[idx]
-			saveConfig(m.db, m.config)
 
 		case "up", "down", "left", "right":
 			// Pass to tree
@@ -849,16 +1048,21 @@ func (m model) View() string {
 		header = fmt.Sprintf("%s %s", tagStyle.Render("[@"+m.activeTag+"]"), m.input.View())
 	}
 
+	shortcuts := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render(
+		"Ctrl+O: config  Ctrl+T: tags  Ctrl+D: drill  Tab/Shift+Tab: action  Enter: open  Ctrl+C: quit",
+	)
+
 	return lipgloss.JoinVertical(
 		lipgloss.Left,
 		header,
 		m.tree.View(),
 		m.actionTabsView(),
+		shortcuts,
 	)
 }
 
 func (m model) actionTabsView() string {
-	actions := []string{"terminal", "explorer", "editor", "copy"}
+	actions := buildActions(m.config)
 	var tabs []string
 	for _, a := range actions {
 		style := lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
@@ -873,35 +1077,99 @@ func (m model) actionTabsView() string {
 
 func (m model) configView() string {
 	title := lipgloss.NewStyle().Bold(true).Render("Config")
-	help := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("Esc: back • Enter: edit/save • Left/Right: cycle default")
+	help := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("Esc: back • Enter: edit/save • Left/Right: cycle default • A: add custom • D: delete custom")
+	hint := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("Custom actions: Enter edits name then cmd")
 
-	fields := []string{
-		fmt.Sprintf("Default action: %s", m.config.DefaultAction),
-		fmt.Sprintf("Terminal cmd: %s", m.config.TerminalCmd),
-		fmt.Sprintf("Explorer cmd: %s", m.config.ExplorerCmd),
-		fmt.Sprintf("Editor cmd: %s", m.config.EditorCmd),
-	}
+	keyStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+	valueStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("255"))
 
 	var lines []string
-	for i, f := range fields {
+	for i := 0; i < 5; i++ {
 		prefix := "  "
 		if i == m.configField {
 			prefix = "> "
 		}
-		lines = append(lines, prefix+f)
-	}
 
-	editLine := ""
-	if m.configEditing {
-		editLine = lipgloss.NewStyle().Foreground(lipgloss.Color("62")).Render("Edit: ") + m.configInput.View()
+		switch i {
+		case 0:
+			key := keyStyle.Render("Default action: ")
+			if m.configField == 0 {
+				bracket := lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true)
+				selected := lipgloss.NewStyle().Foreground(lipgloss.Color("62")).Bold(true)
+				actionInline := lipgloss.JoinHorizontal(
+					lipgloss.Left,
+					bracket.Render("< "),
+					selected.Render(m.config.DefaultAction),
+					bracket.Render(" >"),
+				)
+				lines = append(lines, prefix+key+actionInline)
+			} else {
+				actionInline := "< " + m.config.DefaultAction + " >"
+				lines = append(lines, prefix+key+valueStyle.Render(actionInline))
+			}
+		case 1:
+			key := keyStyle.Render("Terminal cmd: ")
+			if m.configEditing && m.configField == 1 {
+				lines = append(lines, prefix+key+valueStyle.Render(m.configInput.View()))
+			} else {
+				lines = append(lines, prefix+key+valueStyle.Render(m.config.TerminalCmd))
+			}
+		case 2:
+			key := keyStyle.Render("Explorer cmd: ")
+			if m.configEditing && m.configField == 2 {
+				lines = append(lines, prefix+key+valueStyle.Render(m.configInput.View()))
+			} else {
+				lines = append(lines, prefix+key+valueStyle.Render(m.config.ExplorerCmd))
+			}
+		case 3:
+			key := keyStyle.Render("Editor cmd: ")
+			if m.configEditing && m.configField == 3 {
+				lines = append(lines, prefix+key+valueStyle.Render(m.configInput.View()))
+			} else {
+				lines = append(lines, prefix+key+valueStyle.Render(m.config.EditorCmd))
+			}
+		case 4:
+			key := keyStyle.Render("Custom actions: ")
+			customs := parseCustomActions(m.config.CustomActions)
+			if m.customActionIndex >= len(customs) {
+				m.customActionIndex = 0
+			}
+			if m.customEditing && m.configField == 4 {
+				label := "name: "
+				if m.customEditStep == 1 {
+					label = "cmd: "
+				}
+				lines = append(lines, prefix+key+valueStyle.Render(label+m.configInput.View()))
+			} else if len(customs) == 0 {
+				lines = append(lines, prefix+key+valueStyle.Render("(none)"))
+			} else if m.configField == 4 {
+				var parts []string
+				for i, c := range customs {
+					if i == m.customActionIndex {
+						bracket := lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true)
+						selected := lipgloss.NewStyle().Foreground(lipgloss.Color("62")).Bold(true)
+						parts = append(parts, bracket.Render("< ")+selected.Render(c.Name)+bracket.Render(" >"))
+					} else {
+						parts = append(parts, valueStyle.Render(c.Name))
+					}
+				}
+				lines = append(lines, prefix+key+strings.Join(parts, " "))
+			} else {
+				var names []string
+				for _, c := range customs {
+					names = append(names, c.Name)
+				}
+				lines = append(lines, prefix+key+valueStyle.Render(strings.Join(names, ", ")))
+			}
+		}
 	}
 
 	return lipgloss.JoinVertical(
 		lipgloss.Left,
 		title,
 		help,
+		hint,
 		strings.Join(lines, "\n"),
-		editLine,
 	)
 }
 
